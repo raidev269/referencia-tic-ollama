@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .dev/
 *.tmp
+.streamlit/secrets.toml

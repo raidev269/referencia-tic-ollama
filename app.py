@@ -19,6 +19,89 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ferramenta as f  # noqa: E402
 
+from google import genai
+
+
+def extrair_com_gemini_15(texto_documento, categorias_selecionadas, prompt_livre):
+  """Envia o texto do documento e as regras de extração para o Gemini 1.5,
+
+  garantindo restrição estrita ao documento e validação contextual.
+  """
+  api_key = st.secrets.get("GEMINI_API_KEY")
+  if not api_key:
+    return (
+        "Erro: Chave `GEMINI_API_KEY` não encontrada nos segredos do Streamlit"
+        " (.streamlit/secrets.toml)."
+    )
+
+  try:
+    client = genai.Client(api_key=api_key)
+
+    # Instrução de sistema robusta com as restrições solicitadas
+    instrucao_sistema = (
+        "Você é um assistente especialista em licitações públicas sob a Lei"
+        " 14.133/2021.\n"
+        "DIRETRIZES OBRIGATÓRIAS DE EXTRAÇÃO E VALIDAÇÃO:\n"
+        "1. RESTRIÇÃO ABSOLUTA AO DOCUMENTO: Responda e extraia informações"
+        " EXCLUSIVAMENTE com base no texto fornecido. É estritamente proibido"
+        " inventar, presumir ou buscar informações externas.\n"
+        "2. VALIDAÇÃO SEMÂNTICA COMPLETA: Nunca valide ou extraia dados com base"
+        " apenas em correspondências superficiais de palavras-chave isoladas."
+        " Analise o contexto completo do parágrafo e da seção para confirmar"
+        " que o requisito, prazo ou dado pertence de fato ao objeto em"
+        " questão.\n"
+        "3. AUSÊNCIA DE DADOS: Se a informação solicitada não estiver"
+        " explicitamente presente no documento, declare claramente: 'Informação"
+        " não encontrada no documento.'\n"
+        "4. RASTREABILIDADE: Sempre que possível, cite a seção ou contexto de"
+        " onde a informação foi extraída."
+    )
+
+    # Mapeia os filtros pré-fabricados escolhidos nos checkboxes
+    solicitacoes = []
+    if "tecnica" in categorias_selecionadas:
+      solicitacoes.append(
+          "- Especificações Técnicas e Requisitos: Requisitos mínimos do"
+          " equipamento/serviço, marcas/modelos aceitos e prazos de garantia"
+          " exigidos."
+      )
+    if "habilitacao" in categorias_selecionadas:
+      solicitacoes.append(
+          "- Critérios de Habilitação e Qualificação: Certificações exigidas,"
+          " atestados de capacidade técnica e índices de qualificação"
+          " financeira."
+      )
+    if "prazos" in categorias_selecionadas:
+      solicitacoes.append(
+          "- Prazos e Condições de Entrega: Prazos de fornecimento (dias úteis"
+          " ou corridos), locais de entrega e cronograma detalhado."
+      )
+
+    # Monta o prompt do usuário estruturado
+    conteudo_usuario = f"TEXTO DO DOCUMENTO:\n{texto_documento}\n\n"
+    if solicitacoes:
+      conteudo_usuario += (
+          "Realize a extração detalhada para as seguintes categorias"
+          f" selecionadas:\n"
+          + "\n".join(solicitacoes)
+          + "\n"
+      )
+    if prompt_livre:
+      conteudo_usuario += (
+          "\nPERGUNTA / PROMPT CUSTOMIZADO EM LINGUAGEM NATURAL:\n"
+          f"{prompt_livre}\n"
+      )
+
+    # Chamada ao modelo Gemini 1.5 Flash
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=[instrucao_sistema, conteudo_usuario],
+    )
+    return response.text
+
+  except Exception as e:
+    return f"Ocorreu um erro ao comunicar com a API do Gemini: {str(e)}"
+  
 # modo rápido = menos páginas e menos consultas (mais rápido, amostra menor); completo = limites do ferramenta.py
 MODOS = {"rápido": {"MAX_PAGINAS_CATALOGO": 3, "MAX_VINCULOS": 10, "MAX_RESULTADOS": 10, "MAX_COMPRAS": 10},
          "completo": {"MAX_PAGINAS_CATALOGO": f.MAX_PAGINAS_CATALOGO, "MAX_VINCULOS": f.MAX_VINCULOS,
@@ -412,75 +495,220 @@ st.download_button("Baixar CSV (ordem desta tela)", df.to_csv(sep=";", index=Fal
 # ----------------------------------------------------------------- linha escolhida
 st.subheader("Documentos e texto para IA")
 opcoes = df["linha"].tolist()
-escolha = st.selectbox("Linha", opcoes, format_func=lambda n: f"{n} – " + df.loc[df["linha"] == n, "orgao"].iloc[0][:50]
-                       + " – " + df.loc[df["linha"] == n, "descricao_item"].iloc[0][:60])
-outros = st.checkbox("Baixar também propostas, atas e despachos (podem ser dezenas de arquivos grandes)", value=False)
+escolha = st.selectbox(
+    "Linha",
+    opcoes,
+    format_func=lambda n: (
+        f"{n} – "
+        + df.loc[df["linha"] == n, "orgao"].iloc[0][:50]
+        + " – "
+        + df.loc[df["linha"] == n, "descricao_item"].iloc[0][:60]
+    ),
+)
+outros = st.checkbox(
+    "Baixar também propostas, atas e despachos (podem ser dezenas de arquivos"
+    " grandes)",
+    value=False,
+)
 if st.button("Baixar documentos da linha"):
-    barra_doc = st.progress(0.0, text="Documentos: aguardando a lista de arquivos")
-    agora_doc = st.empty()
-    dl = {"total": None, "feito": 0, "ini": time.time()}
+  barra_doc = st.progress(0.0, text="Documentos: aguardando a lista de arquivos")
+  agora_doc = st.empty()
+  dl = {"total": None, "feito": 0, "ini": time.time()}
 
-    def ao_baixar(fase, url, params, resultado):
-        """Mostra o arquivo atual e 'feito de total' no download (o total vem da lista de arquivos do PNCP)."""
-        if fase == "antes":
-            agora_doc.markdown(f"**Agora:** {acao_atual(url, params)}")
-            return
-        if url.endswith("/arquivos") and isinstance(resultado[1], list):
-            ativos = [a for a in resultado[1] if a.get("statusAtivo") is not False]
-            dl["total"] = len(ativos) if outros else sum(1 for a in ativos if f.eh_principal(a))  # mesma regra da opção 3
-        elif re.search(r"/arquivos/\d+$", url) or "pncp-api" in url:
-            dl["feito"] += 1
-        if dl["total"]:
-            pct = min(dl["feito"] / dl["total"], 1.0)
-            resta = f" · faltam ~{tempo_fmt((time.time() - dl['ini']) / dl['feito'] * (dl['total'] - dl['feito']))}" if 0 < dl["feito"] < dl["total"] else ""
-            barra_doc.progress(pct, text=f"Documentos: {pct:.0%} · {dl['feito']} de {dl['total']} arquivos{resta}")
 
-    with respondendo([escolha, "s" if outros else "n"], ao_baixar) as log:
-        f.opcao_3_baixar()
-    agora_doc.markdown("**Agora:** download concluído")
-    texto = log.getvalue()
-    m_dest = re.search(r"Documentos em: (.+)", texto)
-    st.session_state["docs"] = {"linha": escolha, "pasta": m_dest.group(1).strip() if m_dest else "", "log": texto}
+  def ao_baixar(fase, url, params, resultado):
+    """Mostra o arquivo atual e 'feito de total' no download (o total vem da lista de arquivos do PNCP)."""
+    if fase == "antes":
+      agora_doc.markdown(f"**Agora:** {acao_atual(url, params)}")
+      return
+    if url.endswith("/arquivos") and isinstance(resultado[1], list):
+      ativos = [a for a in resultado[1] if a.get("statusAtivo") is not False]
+      dl["total"] = (
+          len(ativos) if outros else sum(1 for a in ativos if f.eh_principal(a))
+      )  # mesma regra da opção 3
+    elif re.search(r"/arquivos/\d+$", url) or "pncp-api" in url:
+      dl["feito"] += 1
+    if dl["total"]:
+      pct = min(dl["feito"] / dl["total"], 1.0)
+      resta = (
+          f" · faltam ~{tempo_fmt((time.time() - dl['ini']) / dl['feito'] * (dl['total'] - dl['feito']))}"
+          if 0 < dl["feito"] < dl["total"]
+          else ""
+      )
+      barra_doc.progress(
+          pct,
+          text=(
+              f"Documentos: {pct:.0%} · {dl['feito']} de {dl['total']}"
+              f" arquivos{resta}"
+          ),
+      )
+
+
+  with respondendo([escolha, "s" if outros else "n"], ao_baixar) as log:
+    f.opcao_3_baixar()
+  agora_doc.markdown("**Agora:** download concluído")
+  texto = log.getvalue()
+  m_dest = re.search(r"Documentos em: (.+)", texto)
+  st.session_state["docs"] = {
+      "linha": escolha,
+      "pasta": m_dest.group(1).strip() if m_dest else "",
+      "log": texto,
+  }
 
 docs = st.session_state.get("docs")
 if docs and docs["linha"] == escolha:
-    if not docs["pasta"]:
-        st.warning(docs["log"].strip() or "Nada foi baixado.")
-    else:
-        pasta = Path(docs["pasta"])
-        arquivos = [p for p in sorted(pasta.rglob("*")) if p.is_file() and not p.name.startswith("_lista")]
-        st.write(f"Pasta: `{pasta}`")
-        st.dataframe(pd.DataFrame([{"arquivo": str(p.relative_to(pasta)), "tamanho (KB)": round(p.stat().st_size / 1024)} for p in arquivos]),
-                     hide_index=True, use_container_width=True)
-        pdfs = [p for p in arquivos if p.suffix.lower() in f.EXTENSOES_RECORTE]  # PDF e Word
-        if pdfs:
-            pdf = st.selectbox("Documento para recortar: PDF ou Word (de preferência o TR)", pdfs, format_func=lambda p: p.name,
-                               index=next((i for i, p in enumerate(pdfs) if re.search(r"termo|\btr\b", f.norm(p.name))), 0))
-            if st.button("Gerar texto para IA"):
-                todos = f.documentos_recortaveis()  # mesma lista da opção 4
-                item = resumo.get("produto") or produto  # item pedido no recorte = produto da busca
-                with st.spinner("Recortando as páginas do item..."):
-                    with respondendo([todos.index(pdf) + 1, item]) as log4:
-                        f.opcao_4_recortar()
-                    m_rec = re.search(r"Recorte salvo em: (.+)", log4.getvalue())
-                    m_av = re.search(r"Aviso: ((?:Word|Convertido).+)", log4.getvalue())
-                    if m_av:
-                        st.info(m_av.group(1))
-                    if not m_rec:
-                        m_nao = re.search(r"Não foi possível recortar: (.+)", log4.getvalue())
-                        st.error(m_nao.group(1) if m_nao else log4.getvalue())
-                        st.stop()
-                    recs = sorted((f.SAIDA / "recortes").glob("*/recorte.txt"))  # mesma lista da opção 5
-                    with respondendo([recs.index(Path(m_rec.group(1).strip())) + 1]) as log5:
-                        f.opcao_5_texto_ia()
-                m_ia = re.search(r"Pronto para colar: (.+?)\s+\(", log5.getvalue())
-                if m_ia:
-                    alvo = Path(m_ia.group(1))
-                    texto_ia = alvo.read_text(encoding="utf-8")
-                    st.success(f"Pronto: `{alvo}` (~{len(texto_ia) // 4:,} tokens). Copie e cole na IA; a resposta é rascunho para conferência humana.")
-                    st.download_button("Baixar o .txt", texto_ia.encode("utf-8"), file_name=alvo.name, mime="text/plain")
-                    st.text_area("Texto para colar na IA", texto_ia, height=300)
-                else:
-                    st.error(log5.getvalue())
+  if not docs["pasta"]:
+    st.warning(docs["log"].strip() or "Nada foi baixado.")
+  else:
+    pasta = Path(docs["pasta"])
+    arquivos = [
+        p
+        for p in sorted(pasta.rglob("*"))
+        if p.is_file() and not p.name.startswith("_lista")
+    ]
+    st.write(f"Pasta: `{pasta}`")
+    st.dataframe(
+        pd.DataFrame([{
+            "arquivo": str(p.relative_to(pasta)),
+            "tamanho (KB)": round(p.stat().st_size / 1024),
+        } for p in arquivos]),
+        hide_index=True,
+        use_container_width=True,
+    )
+    pdfs = [
+        p for p in arquivos if p.suffix.lower() in f.EXTENSOES_RECORTE
+    ]  # PDF e Word
+    if pdfs:
+      pdf = st.selectbox(
+          "Documento para recortar: PDF ou Word (de preferência o TR)",
+          pdfs,
+          format_func=lambda p: p.name,
+          index=next(
+              (
+                  i
+                  for i, p in enumerate(pdfs)
+                  if re.search(r"termo|\btr\b", f.norm(p.name))
+              ),
+              0,
+          ),
+      )
+      if st.button("Gerar texto para IA"):
+        todos = f.documentos_recortaveis()  # mesma lista da opção 4
+        item = (
+            resumo.get("produto") or produto
+        )  # item pedido no recorte = produto da busca
+        with st.spinner("Recortando as páginas do item..."):
+          with respondendo([todos.index(pdf) + 1, item]) as log4:
+            f.opcao_4_recortar()
+          m_rec = re.search(r"Recorte salvo em: (.+)", log4.getvalue())
+          m_av = re.search(r"Aviso: ((?:Word|Convertido).+)", log4.getvalue())
+          if m_av:
+            st.info(m_av.group(1))
+          if not m_rec:
+            m_nao = re.search(
+                r"Não foi possível recortar: (.+)", log4.getvalue()
+            )
+            st.error(m_nao.group(1) if m_nao else log4.getvalue())
+            st.stop()
+          recs = sorted(
+              (f.SAIDA / "recortes").glob("*/recorte.txt")
+          )  # mesma lista da opção 5
+          with respondendo(
+              [recs.index(Path(m_rec.group(1).strip())) + 1]
+          ) as log5:
+            f.opcao_5_texto_ia()
+
+        # Leitura do arquivo gerado pelo recorte e integração do Gemini 1.5
+        m_ia = re.search(r"Pronto para colar: (.+?)\s+\(", log5.getvalue())
+        if m_ia:
+          alvo = Path(m_ia.group(1))
+          texto_ia = alvo.read_text(encoding="utf-8")
+          st.success(
+              f"Pronto: `{alvo}` (~{len(texto_ia) // 4:,} tokens). Documento"
+              " pronto para análise com IA."
+          )
+
+          # ==========================================
+          # ETAPA 3 & 4: FILTROS E CHAMADA DO GEMINI 1.5
+          # ==========================================
+          st.markdown("---")
+          st.subheader(
+              "Etapa 3: Extração Inteligente de Informações (Gemini 1.5)"
+          )
+          st.write(
+              "Selecione os filtros pré-fabricados ou utilize a consulta em"
+              " linguagem natural:"
+          )
+
+          # 1. Filtros Pré-fabricados (Checkboxes)
+          col_chk1, col_chk2, col_chk3 = st.columns(3)
+          chk_tecnica = col_chk1.checkbox(
+              "Especificações Técnicas e Requisitos",
+              help="Requisitos mínimos, marcas/modelos e garantia",
+          )
+          chk_habilitacao = col_chk2.checkbox(
+              "Critérios de Habilitação e Qualificação",
+              help="Certificações, atestados e índices financeiros",
+          )
+          chk_prazos = col_chk3.checkbox(
+              "Prazos e Condições de Entrega",
+              help="Prazos de fornecimento e locais",
+          )
+
+          # 2. Campo de Extração Deliberada (Linguagem Natural)
+          prompt_livre = st.text_area(
+              "Campo de Extração Deliberada (Prompt Customizado)",
+              placeholder=(
+                  'Ex.: "Extraia se há exigência de suporte técnico presencial'
+                  ' em Brasília e qual é o SLA de atendimento em horas."'
+              ),
+          )
+
+          if st.button("Executar Análise com Gemini 1.5", type="primary"):
+            categorias = []
+            if chk_tecnica:
+              categorias.append("tecnica")
+            if chk_habilitacao:
+              categorias.append("habilitacao")
+            if chk_prazos:
+              categorias.append("prazos")
+
+            if not categorias and not prompt_livre.strip():
+              st.warning(
+                  "Selecione pelo menos uma categoria nos checkboxes ou digite"
+                  " uma pergunta no campo livre."
+              )
+            else:
+              with st.spinner(
+                  "Analisando documento com Gemini 1.5 (Validação contextual"
+                  " rigorosa em andamento)..."
+              ):
+                resposta_gemini = extrair_com_gemini_15(
+                    texto_ia, categorias, prompt_livre
+                )
+
+              st.success("Análise concluída com sucesso!")
+              st.markdown("### Resultado da Extração via Gemini 1.5")
+              st.markdown(resposta_gemini)
+
+              # Opção de exportação do resultado da IA
+              st.download_button(
+                  "Baixar Relatório da IA (.txt)",
+                  resposta_gemini.encode("utf-8"),
+                  file_name=f"extracao_gemini_{alvo.stem}.txt",
+                  mime="text/plain",
+              )
+
+          # Caixa de texto tradicional (opcional para conferência do texto bruto)
+          with st.expander("Ver texto bruto recortado para conferência"):
+            st.download_button(
+                "Baixar o .txt bruto",
+                texto_ia.encode("utf-8"),
+                file_name=alvo.name,
+                mime="text/plain",
+            )
+            st.text_area("Texto cru", texto_ia, height=200)
         else:
-            st.info("Nenhum PDF ou documento Word entre os arquivos baixados.")
+          st.error(log5.getvalue())
+    else:
+      st.info("Nenhum PDF ou documento Word entre os arquivos baixados.")
