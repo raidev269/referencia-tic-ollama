@@ -633,7 +633,7 @@ if docs and docs["linha"] == escolha:
           # ==========================================
           st.markdown("---")
           st.subheader(
-              "Etapa 3: Extração Inteligente de Informações (Gemini 1.5)"
+              " Extração Inteligente de Informações (Gemini 1.5)"
           )
           st.write(
               "Selecione os filtros pré-fabricados ou utilize a consulta em"
@@ -712,3 +712,31 @@ if docs and docs["linha"] == escolha:
           st.error(log5.getvalue())
     else:
       st.info("Nenhum PDF ou documento Word entre os arquivos baixados.")
+      # --- ETAPA 3: EXTRAÇÃO COM GEMINI 1.5 ---
+if "arquivo_para_ia" in st.session_state and st.session_state["arquivo_para_ia"]:
+    st.subheader("Extração Inteligente de Informações (Gemini 1.5)")
+    
+    with st.form("form_extracao_ia"):
+        st.write("Selecione os filtros pré-fabricados ou utilize a consulta em linguagem natural:")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            f_espec = st.checkbox("Especificações Técnicas e Requisitos")
+        with col2:
+            f_hab = st.checkbox("Critérios de Habilitação e Qualificação")
+        with col3:
+            f_prazo = st.checkbox("Prazos e Condições de Entrega")
+        
+        prompt_custom = st.text_area("Campo de Extração Deliberada (Prompt Customizado)")
+        executou = st.form_submit_button("Executar Análise com Gemini 1.5", type="primary")
+    
+    if executou:
+        with st.spinner("Analisando o edital com o Gemini 1.5..."):
+            with open(st.session_state["arquivo_para_ia"], "r", encoding="utf-8") as f:
+                texto_edital = f.read()
+            
+            resposta = extrair_com_gemini_15(texto_edital, f_espec, f_hab, f_prazo, prompt_custom)
+            st.session_state["resposta_gemini"] = resposta
+
+    if "resposta_gemini" in st.session_state:
+        st.markdown("### Resultado da Extração")
+        st.markdown(st.session_state["resposta_gemini"])
