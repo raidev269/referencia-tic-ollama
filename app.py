@@ -19,89 +19,117 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ferramenta as f  # noqa: E402
 
+
+import os
+
 from google import genai
+from google.genai import types
+
+# Modelos tentados em ordem. O "gemini-1.5-flash" foi DESLIGADO pelo Google em 29/09/2025 (erro 404),
+# por isso o app antigo nunca devolvia nada. Para trocar de modelo sem mexer no código, ponha
+# GEMINI_MODEL = "nome-do-modelo" no .streamlit/secrets.toml.
+MODELOS_PADRAO = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-flash-lite"]
+
+INSTRUCAO_SISTEMA = (
+    "Você é um assistente especialista em licitações públicas sob a Lei 14.133/2021.\n"
+    "DIRETRIZES OBRIGATÓRIAS DE EXTRAÇÃO E VALIDAÇÃO:\n"
+    "1. RESTRIÇÃO ABSOLUTA AO DOCUMENTO: responda EXCLUSIVAMENTE com base no texto fornecido. "
+    "É proibido inventar, presumir ou buscar informações externas.\n"
+    "2. VALIDAÇÃO SEMÂNTICA COMPLETA: nunca extraia dados só por palavra-chave isolada. Analise o contexto do "
+    "parágrafo e da seção para confirmar que o requisito, prazo ou dado pertence ao objeto em questão.\n"
+    "3. AUSÊNCIA DE DADOS: se a informação não estiver explícita no documento, diga: "
+    "'Informação não encontrada no documento.'\n"
+    "4. RASTREABILIDADE: cite sempre a página (marcas '=== PÁGINA N ===') e a seção de onde veio cada informação."
+)
+
+PEDIDOS_PADRAO = {
+    "tecnica": "- Especificações Técnicas e Requisitos: requisitos mínimos do equipamento/serviço, marcas/modelos "
+               "aceitos e prazos de garantia exigidos.",
+    "habilitacao": "- Critérios de Habilitação e Qualificação: certificações exigidas, atestados de capacidade "
+                   "técnica e índices de qualificação financeira.",
+    "prazos": "- Prazos e Condições de Entrega: prazos de fornecimento (dias úteis ou corridos), locais de entrega "
+              "e cronograma detalhado.",
+    "sancoes": "- Sanções e Penalidades: percentuais de multa por atraso e cláusulas de rescisão contratual.",
+    "valores": "- Valores e Quantitativos: preço estimado/máximo por unidade, quantidade total e valor global do item.",
+}
 
 
-def extrair_com_gemini_15(texto_documento, categorias_selecionadas, prompt_livre):
-  """Envia o texto do documento e as regras de extração para o Gemini 1.5,
+def obter_chave():
+    """Chave do Gemini: secrets do Streamlit, variável de ambiente ou campo da barra lateral."""
+    try:
+        chave = st.secrets["GEMINI_API_KEY"]  # sem secrets.toml isto levanta erro; por isso o try
+    except Exception:
+        chave = None
+    return (chave or os.environ.get("GEMINI_API_KEY") or st.session_state.get("gemini_key_input") or "").strip()
 
-  garantindo restrição estrita ao documento e validação contextual.
-  """
-  api_key = st.secrets.get("GEMINI_API_KEY")
-  if not api_key:
-    return (
-        "Erro: Chave `GEMINI_API_KEY` não encontrada nos segredos do Streamlit"
-        " (.streamlit/secrets.toml)."
-    )
 
-  try:
-    client = genai.Client(api_key=api_key)
+def lista_de_modelos():
+    try:
+        escolhido = st.secrets["GEMINI_MODEL"]
+    except Exception:
+        escolhido = os.environ.get("GEMINI_MODEL")
+    return ([escolhido] if escolhido else []) + [m for m in MODELOS_PADRAO if m != escolhido]
 
-    # Instrução de sistema robusta com as restrições solicitadas
-    instrucao_sistema = (
-        "Você é um assistente especialista em licitações públicas sob a Lei"
-        " 14.133/2021.\n"
-        "DIRETRIZES OBRIGATÓRIAS DE EXTRAÇÃO E VALIDAÇÃO:\n"
-        "1. RESTRIÇÃO ABSOLUTA AO DOCUMENTO: Responda e extraia informações"
-        " EXCLUSIVAMENTE com base no texto fornecido. É estritamente proibido"
-        " inventar, presumir ou buscar informações externas.\n"
-        "2. VALIDAÇÃO SEMÂNTICA COMPLETA: Nunca valide ou extraia dados com base"
-        " apenas em correspondências superficiais de palavras-chave isoladas."
-        " Analise o contexto completo do parágrafo e da seção para confirmar"
-        " que o requisito, prazo ou dado pertence de fato ao objeto em"
-        " questão.\n"
-        "3. AUSÊNCIA DE DADOS: Se a informação solicitada não estiver"
-        " explicitamente presente no documento, declare claramente: 'Informação"
-        " não encontrada no documento.'\n"
-        "4. RASTREABILIDADE: Sempre que possível, cite a seção ou contexto de"
-        " onde a informação foi extraída."
-    )
 
-    # Mapeia os filtros pré-fabricados escolhidos nos checkboxes
-    solicitacoes = []
-    if "tecnica" in categorias_selecionadas:
-      solicitacoes.append(
-          "- Especificações Técnicas e Requisitos: Requisitos mínimos do"
-          " equipamento/serviço, marcas/modelos aceitos e prazos de garantia"
-          " exigidos."
-      )
-    if "habilitacao" in categorias_selecionadas:
-      solicitacoes.append(
-          "- Critérios de Habilitação e Qualificação: Certificações exigidas,"
-          " atestados de capacidade técnica e índices de qualificação"
-          " financeira."
-      )
-    if "prazos" in categorias_selecionadas:
-      solicitacoes.append(
-          "- Prazos e Condições de Entrega: Prazos de fornecimento (dias úteis"
-          " ou corridos), locais de entrega e cronograma detalhado."
-      )
+def chamar_gemini(texto_documento, categorias, prompt_livre):
+    """Devolve (texto, erro, modelo_usado). Nunca levanta exceção e nunca devolve erro disfarçado de resposta."""
+    chave = obter_chave()
+    if not chave:
+        return None, ("Chave do Gemini não encontrada. Crie a chave em https://aistudio.google.com/apikey e coloque em "
+                      ".streamlit/secrets.toml (GEMINI_API_KEY = \"...\"), nos Secrets da Streamlit Cloud, "
+                      "ou cole no campo da barra lateral."), None
 
-    # Monta o prompt do usuário estruturado
-    conteudo_usuario = f"TEXTO DO DOCUMENTO:\n{texto_documento}\n\n"
-    if solicitacoes:
-      conteudo_usuario += (
-          "Realize a extração detalhada para as seguintes categorias"
-          f" selecionadas:\n"
-          + "\n".join(solicitacoes)
-          + "\n"
-      )
-    if prompt_livre:
-      conteudo_usuario += (
-          "\nPERGUNTA / PROMPT CUSTOMIZADO EM LINGUAGEM NATURAL:\n"
-          f"{prompt_livre}\n"
-      )
+    pedidos = [PEDIDOS_PADRAO[c] for c in categorias if c in PEDIDOS_PADRAO]
+    conteudo = f"TEXTO INTEGRAL DO DOCUMENTO:\n{texto_documento}\n\n"
+    if pedidos:
+        conteudo += "Faça a extração detalhada para as categorias abaixo:\n" + "\n".join(pedidos) + "\n"
+    if prompt_livre.strip():
+        conteudo += f"\nPERGUNTA / PROMPT CUSTOMIZADO:\n{prompt_livre.strip()}\n"
 
-    # Chamada ao modelo Gemini 1.5 Flash
-    response = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=[instrucao_sistema, conteudo_usuario],
-    )
-    return response.text
+    try:
+        cliente = genai.Client(api_key=chave, http_options=types.HttpOptions(timeout=600_000))  # 10 min (ms)
+    except Exception as e:
+        return None, f"Não consegui iniciar o cliente do Gemini: {type(e).__name__}: {e}", None
 
-  except Exception as e:
-    return f"Ocorreu um erro ao comunicar com a API do Gemini: {str(e)}"
-  
+    config = types.GenerateContentConfig(system_instruction=INSTRUCAO_SISTEMA, temperature=0.2)
+    ultimo_erro = "sem detalhes"
+    for modelo in lista_de_modelos():
+        for tentativa in range(3):
+            try:
+                resp = cliente.models.generate_content(model=modelo, contents=conteudo, config=config)
+                if resp.text:
+                    return resp.text, None, modelo
+                motivo = ""
+                if resp.candidates:
+                    motivo = f" (motivo: {resp.candidates[0].finish_reason})"
+                elif getattr(resp, "prompt_feedback", None):
+                    motivo = f" (bloqueio: {resp.prompt_feedback})"
+                ultimo_erro = f"O modelo {modelo} respondeu vazio{motivo}."
+                break  # tenta o próximo modelo
+            except Exception as e:
+                codigo = getattr(e, "code", None)
+                msg = str(getattr(e, "message", None) or e)
+                ultimo_erro = f"{modelo}: erro {codigo or type(e).__name__}: {msg[:400]}"
+                if codigo == 404:
+                    break  # modelo não existe mais: próximo da lista
+                if codigo in (400, 401, 403) and ("API key" in msg or "API_KEY" in msg or codigo in (401, 403)):
+                    return None, f"A chave do Gemini foi recusada ou não tem permissão. Detalhe: {msg[:300]}", modelo
+                if codigo == 429:
+                    return None, ("Limite do plano gratuito atingido (erro 429): muitas chamadas ou muitos tokens por "
+                                  f"minuto. O documento inteiro é grande; espere 1 minuto e tente de novo. Detalhe: {msg[:300]}"), modelo
+                if codigo in (500, 503, 504) or codigo is None:
+                    time.sleep(3 * (tentativa + 1))  # servidor ocupado: espera e tenta de novo
+                    continue
+                return None, ultimo_erro, modelo
+    return None, f"Nenhum modelo respondeu. Último problema: {ultimo_erro}", None
+
+
+def montar_texto_completo(caminho, paginas):
+    """Texto INTEGRAL do documento (sem recortes), com a marca '=== PÁGINA N ===' em cada página."""
+    cab = f"DOCUMENTO: {caminho.name} | {len(paginas)} páginas | texto integral, sem recortes\n"
+    return cab + "".join(f"\n=== PÁGINA {i} ===\n{(p or '').strip()}\n" for i, p in enumerate(paginas, 1))
+
+
 # modo rápido = menos páginas e menos consultas (mais rápido, amostra menor); completo = limites do ferramenta.py
 MODOS = {"rápido": {"MAX_PAGINAS_CATALOGO": 3, "MAX_VINCULOS": 10, "MAX_RESULTADOS": 10, "MAX_COMPRAS": 10},
          "completo": {"MAX_PAGINAS_CATALOGO": f.MAX_PAGINAS_CATALOGO, "MAX_VINCULOS": f.MAX_VINCULOS,
@@ -226,6 +254,7 @@ def carregar_ultima():
 
 # ----------------------------------------------------------------- tela
 st.set_page_config(page_title="Referência TIC", layout="wide")
+st.sidebar.text_input("Chave do Gemini (só se não estiver nos secrets)", type="password", key="gemini_key_input")
 st.title("Referência TIC – busca de compras públicas")
 st.caption("Só dados públicos (PNCP e Compras.gov.br). A busca e os filtros são regras fixas, sem IA. "
            "O resultado apoia a decisão; não substitui a pesquisa de preços formal da Lei 14.133/2021.")
@@ -425,6 +454,8 @@ if buscar:
     relogio.write(f"Tempo total: {tempo_fmt(time.time() - inicio)}")
     st.session_state["log_busca"] = "\n".join(logs)
     st.session_state.pop("docs", None)
+    st.session_state.pop("doc_ia", None)
+    st.session_state.pop("resp_ia", None)
 
 resumo, df = carregar_ultima()
 if resumo is None:
@@ -493,7 +524,7 @@ st.download_button("Baixar CSV (ordem desta tela)", df.to_csv(sep=";", index=Fal
                    file_name=Path(resumo["arquivo"]).name.replace(".csv", "_tela.csv"), mime="text/csv")
 
 # ----------------------------------------------------------------- linha escolhida
-st.subheader("Documentos e texto para IA")
+st.subheader("Documentos e análise com IA")
 opcoes = df["linha"].tolist()
 escolha = st.selectbox(
     "Linha",
@@ -575,168 +606,87 @@ if docs and docs["linha"] == escolha:
         hide_index=True,
         use_container_width=True,
     )
-    pdfs = [
-        p for p in arquivos if p.suffix.lower() in f.EXTENSOES_RECORTE
-    ]  # PDF e Word
-    if pdfs:
+    pdfs = [p for p in arquivos if p.suffix.lower() in f.EXTENSOES_RECORTE]  # PDF e Word
+    if not pdfs:
+      st.info("Nenhum PDF ou documento Word entre os arquivos baixados.")
+    else:
       pdf = st.selectbox(
-          "Documento para recortar: PDF ou Word (de preferência o TR)",
+          "Documento para analisar: PDF ou Word (de preferência o TR)",
           pdfs,
           format_func=lambda p: p.name,
-          index=next(
-              (
-                  i
-                  for i, p in enumerate(pdfs)
-                  if re.search(r"termo|\btr\b", f.norm(p.name))
-              ),
-              0,
-          ),
+          index=next((i for i, p in enumerate(pdfs) if re.search(r"termo|\btr\b", f.norm(p.name))), 0),
       )
-      if st.button("Gerar texto para IA"):
-        todos = f.documentos_recortaveis()  # mesma lista da opção 4
-        item = (
-            resumo.get("produto") or produto
-        )  # item pedido no recorte = produto da busca
-        with st.spinner("Recortando as páginas do item..."):
-          with respondendo([todos.index(pdf) + 1, item]) as log4:
-            f.opcao_4_recortar()
-          m_rec = re.search(r"Recorte salvo em: (.+)", log4.getvalue())
-          m_av = re.search(r"Aviso: ((?:Word|Convertido).+)", log4.getvalue())
-          if m_av:
-            st.info(m_av.group(1))
-          if not m_rec:
-            m_nao = re.search(
-                r"Não foi possível recortar: (.+)", log4.getvalue()
-            )
-            st.error(m_nao.group(1) if m_nao else log4.getvalue())
-            st.stop()
-          recs = sorted(
-              (f.SAIDA / "recortes").glob("*/recorte.txt")
-          )  # mesma lista da opção 5
-          with respondendo(
-              [recs.index(Path(m_rec.group(1).strip())) + 1]
-          ) as log5:
-            f.opcao_5_texto_ia()
-
-        # Leitura do arquivo gerado pelo recorte e integração do Gemini 1.5
-        m_ia = re.search(r"Pronto para colar: (.+?)\s+\(", log5.getvalue())
-        if m_ia:
-          alvo = Path(m_ia.group(1))
-          texto_ia = alvo.read_text(encoding="utf-8")
-          st.success(
-              f"Pronto: `{alvo}` (~{len(texto_ia) // 4:,} tokens). Documento"
-              " pronto para análise com IA."
-          )
-
-          # ==========================================
-          # ETAPA 3 & 4: FILTROS E CHAMADA DO GEMINI 1.5
-          # ==========================================
-          st.markdown("---")
-          st.subheader(
-              " Extração Inteligente de Informações (Gemini 1.5)"
-          )
-          st.write(
-              "Selecione os filtros pré-fabricados ou utilize a consulta em"
-              " linguagem natural:"
-          )
-
-          # 1. Filtros Pré-fabricados (Checkboxes)
-          col_chk1, col_chk2, col_chk3 = st.columns(3)
-          chk_tecnica = col_chk1.checkbox(
-              "Especificações Técnicas e Requisitos",
-              help="Requisitos mínimos, marcas/modelos e garantia",
-          )
-          chk_habilitacao = col_chk2.checkbox(
-              "Critérios de Habilitação e Qualificação",
-              help="Certificações, atestados e índices financeiros",
-          )
-          chk_prazos = col_chk3.checkbox(
-              "Prazos e Condições de Entrega",
-              help="Prazos de fornecimento e locais",
-          )
-
-          # 2. Campo de Extração Deliberada (Linguagem Natural)
-          prompt_livre = st.text_area(
-              "Campo de Extração Deliberada (Prompt Customizado)",
-              placeholder=(
-                  'Ex.: "Extraia se há exigência de suporte técnico presencial'
-                  ' em Brasília e qual é o SLA de atendimento em horas."'
-              ),
-          )
-
-          if st.button("Executar Análise com Gemini 1.5", type="primary"):
-            categorias = []
-            if chk_tecnica:
-              categorias.append("tecnica")
-            if chk_habilitacao:
-              categorias.append("habilitacao")
-            if chk_prazos:
-              categorias.append("prazos")
-
-            if not categorias and not prompt_livre.strip():
-              st.warning(
-                  "Selecione pelo menos uma categoria nos checkboxes ou digite"
-                  " uma pergunta no campo livre."
-              )
-            else:
-              with st.spinner(
-                  "Analisando documento com Gemini 1.5 (Validação contextual"
-                  " rigorosa em andamento)..."
-              ):
-                resposta_gemini = extrair_com_gemini_15(
-                    texto_ia, categorias, prompt_livre
-                )
-
-              st.success("Análise concluída com sucesso!")
-              st.markdown("### Resultado da Extração via Gemini 1.5")
-              st.markdown(resposta_gemini)
-
-              # Opção de exportação do resultado da IA
-              st.download_button(
-                  "Baixar Relatório da IA (.txt)",
-                  resposta_gemini.encode("utf-8"),
-                  file_name=f"extracao_gemini_{alvo.stem}.txt",
-                  mime="text/plain",
-              )
-
-          # Caixa de texto tradicional (opcional para conferência do texto bruto)
-          with st.expander("Ver texto bruto recortado para conferência"):
-            st.download_button(
-                "Baixar o .txt bruto",
-                texto_ia.encode("utf-8"),
-                file_name=alvo.name,
-                mime="text/plain",
-            )
-            st.text_area("Texto cru", texto_ia, height=200)
+      # O botão só PREPARA o texto e guarda no session_state. Tudo que vem depois é desenhado fora do
+      # "if st.button", senão qualquer clique em checkbox some com a tela (era esse o bug).
+      if st.button("Preparar documento completo para IA"):
+        with st.spinner("Lendo o documento inteiro (sem recortes)..."):
+          try:
+            paginas, aviso = f.extrair_paginas(pdf)
+          except Exception as e:
+            paginas, aviso = None, f"{type(e).__name__}: {e}"
+        if paginas is None:
+          st.error(f"Não foi possível ler o documento: {aviso}")
         else:
-          st.error(log5.getvalue())
-    else:
-      st.info("Nenhum PDF ou documento Word entre os arquivos baixados.")
-      # --- ETAPA 3: EXTRAÇÃO COM GEMINI 1.5 ---
-if "arquivo_para_ia" in st.session_state and st.session_state["arquivo_para_ia"]:
-    st.subheader("Extração Inteligente de Informações (Gemini 1.5)")
-    
-    with st.form("form_extracao_ia"):
-        st.write("Selecione os filtros pré-fabricados ou utilize a consulta em linguagem natural:")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            f_espec = st.checkbox("Especificações Técnicas e Requisitos")
-        with col2:
-            f_hab = st.checkbox("Critérios de Habilitação e Qualificação")
-        with col3:
-            f_prazo = st.checkbox("Prazos e Condições de Entrega")
-        
-        prompt_custom = st.text_area("Campo de Extração Deliberada (Prompt Customizado)")
-        executou = st.form_submit_button("Executar Análise com Gemini 1.5", type="primary")
-    
-    if executou:
-        with st.spinner("Analisando o edital com o Gemini 1.5..."):
-            with open(st.session_state["arquivo_para_ia"], "r", encoding="utf-8") as f:
-                texto_edital = f.read()
-            
-            resposta = extrair_com_gemini_15(texto_edital, f_espec, f_hab, f_prazo, prompt_custom)
-            st.session_state["resposta_gemini"] = resposta
+          if aviso:
+            st.info(aviso)
+          corpo = montar_texto_completo(pdf, paginas)
+          try:
+            instrucao = f.INSTRUCAO.read_text(encoding="utf-8").rstrip() + "\n\n"
+          except OSError:
+            instrucao = ""
+          arquivo_ia = instrucao + corpo
+          try:  # cópia em saida/para_ia (na nuvem é temporária; o botão de baixar é o que vale)
+            (f.SAIDA / "para_ia").mkdir(parents=True, exist_ok=True)
+            (f.SAIDA / "para_ia" / f"{pdf.stem[:60]}_COMPLETO_PARA_IA.txt").write_text(arquivo_ia, encoding="utf-8")
+          except OSError:
+            pass
+          st.session_state["doc_ia"] = {"nome": pdf.name, "paginas": len(paginas), "corpo": corpo,
+                                        "arquivo": arquivo_ia, "arq_nome": f"{pdf.stem[:60]}_COMPLETO_PARA_IA.txt"}
+          st.session_state.pop("resp_ia", None)
 
-    if "resposta_gemini" in st.session_state:
-        st.markdown("### Resultado da Extração")
-        st.markdown(st.session_state["resposta_gemini"])
+# ----------------------------------------------------------------- IA (fora de qualquer botão: não some)
+doc_ia = st.session_state.get("doc_ia")
+if doc_ia:
+    st.markdown("---")
+    st.subheader("Documento pronto e análise com Gemini")
+    tokens_est = len(doc_ia["corpo"]) // 4
+    st.success(f"Documento completo: `{doc_ia['nome']}` · {doc_ia['paginas']} páginas · ~{tokens_est:,} tokens (sem recortes).")
+    if tokens_est > 200_000:
+        st.warning("Documento muito grande: no plano gratuito do Gemini isso pode dar erro 429 (limite por minuto). "
+                   "Se der, espere 1 minuto e clique de novo.")
+    st.download_button("Baixar documento completo (.txt) para colar numa IA", doc_ia["arquivo"].encode("utf-8"),
+                       file_name=doc_ia["arq_nome"], mime="text/plain")
+
+    with st.form("form_ia"):  # dentro do form, marcar checkbox não recarrega a tela
+        st.write("Escolha os filtros prontos e/ou escreva uma pergunta:")
+        k1, k2, k3 = st.columns(3)
+        chk_tec = k1.checkbox("Especificações Técnicas e Requisitos")
+        chk_hab = k2.checkbox("Critérios de Habilitação e Qualificação")
+        chk_pra = k3.checkbox("Prazos e Condições de Entrega")
+        k4, k5, _ = st.columns(3)
+        chk_san = k4.checkbox("Sanções e Penalidades")
+        chk_val = k5.checkbox("Valores e Quantitativos")
+        prompt_livre = st.text_area("Pergunta livre (opcional)",
+                                    placeholder='Ex.: "Há exigência de suporte técnico presencial em Brasília? Qual o SLA em horas?"')
+        enviar = st.form_submit_button("Executar análise com Gemini", type="primary")
+
+    if enviar:
+        cats = [c for c, ok in (("tecnica", chk_tec), ("habilitacao", chk_hab), ("prazos", chk_pra),
+                                ("sancoes", chk_san), ("valores", chk_val)) if ok]
+        if not cats and not prompt_livre.strip():
+            st.warning("Marque pelo menos um filtro ou escreva uma pergunta.")
+        else:
+            with st.spinner("Gemini analisando o documento inteiro (pode levar alguns minutos)..."):
+                texto_resp, erro, modelo = chamar_gemini(doc_ia["corpo"], cats, prompt_livre)
+            st.session_state["resp_ia"] = {"doc": doc_ia["nome"], "texto": texto_resp, "erro": erro, "modelo": modelo}
+
+    r = st.session_state.get("resp_ia")
+    if r and r["doc"] == doc_ia["nome"]:
+        if r["erro"]:
+            st.error(r["erro"])
+        else:
+            st.caption(f"Modelo usado: {r['modelo']}")
+            st.markdown("### Resultado da extração")
+            st.markdown(r["texto"])
+            st.download_button("Baixar resultado da IA (.txt)", r["texto"].encode("utf-8"),
+                               file_name=f"extracao_gemini_{Path(doc_ia['nome']).stem[:50]}.txt", mime="text/plain")
